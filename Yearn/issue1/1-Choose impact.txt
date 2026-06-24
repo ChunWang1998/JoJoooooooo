@@ -1,0 +1,3 @@
+3.  Choose Impact(s) - Smart Contract
+
+Griefing (e.g. no profit motive for an attacker, but damage to the users or the protocol)

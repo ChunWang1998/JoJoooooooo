@@ -1,0 +1,150 @@
+1. Title
+
+Lossy Withdrawals Make the Vault Think It Earned Money — and Charge Performance Fees on It
+
+
+2. Description
+## Brief/Intro
+
+Here's the short version: when someone withdraws from a TokenizedStrategy vault and the underlying strategy can't free up the full amount (partial withdrawal with loss), the vault's internal bookkeeping (`lastTotalAssets`) gets knocked down by the *entire* requested amount — even the part that never actually left the strategy. Those tokens are still sitting in the external protocol. But the next time anyone deposits, withdraws, mints, or redeems, `_accrue()` compares the real on-chain total against that under-counted number, sees a gap, and says "hey, we made profit!" It then mints performance fee shares to the fee recipient. No real profit was made. Remaining depositors eat the dilution.
+
+## Vulnerability Details
+
+**What's actually broken**
+
+The bug lives in `_withdraw()` at line 1181. When a withdrawal can't be fully filled, the code does this:
+
+```solidity
+// _withdraw(), lines 1163-1181
+if (idle < assets) {
+    unchecked { loss = assets - idle; }
+    // strategy tried to free funds but couldn't get everything
+    assets = idle;           // only send what we actually got
+}
+// Update assets based on how much we took.
+S.lastTotalAssets -= (assets + loss);   // line 1181 — this is the problem
+```
+
+Think of it this way:
+- `assets` ends up as whatever actually got sent to the user (`idle`)
+- `loss` is the shortfall — tokens the strategy couldn't free up
+- But line 1181 subtracts `assets + loss` from `lastTotalAssets`, which equals the *full original request*
+
+The problem? Those `loss` tokens didn't disappear. They're still deployed in the external strategy. `strategyTotalAssets()` still sees them. Only `lastTotalAssets` acts like they're gone.
+
+**How the phantom profit shows up**
+
+On the very next user action, `_accrue()` runs (lines 1202-1236):
+
+```solidity
+uint256 newTotalAssets = _strategyTotalAssets();   // real total — still has the "lost" tokens
+uint256 oldTotalAssets = S.lastTotalAssets;        // was knocked down too far
+
+if (newTotalAssets > oldTotalAssets) {
+    profit = newTotalAssets - oldTotalAssets;      // fake profit = exactly the loss amount
+    (totalFees, protocolFees, ) = _chargeFees(S, profit, newTotalAssets, true);
+}
+```
+
+Then `_chargeFees()` mints shares straight to the fee recipient (lines 1306-1310):
+
+```solidity
+_mint(S, S.performanceFeeRecipient, totalFeeShares - protocolFeeShares);
+```
+
+No lock. No vesting. No clawback. Fee recipient can cash out immediately.
+
+**Quick mental model**
+
+| What | After a lossy withdrawal |
+|---|---|
+| `lastTotalAssets` | Too low — off by exactly `loss` |
+| `strategyTotalAssets()` | Correct — tokens still in the strategy |
+| Gap between them | = `loss` amount |
+| When it bites | Next deposit / withdraw / mint / redeem |
+
+## Impact Details
+
+**Who loses money and how much**
+
+Every time this happens:
+- Fee recipient gets new shares worth roughly `loss × performanceFee%`
+- Everyone still in the vault gets diluted by that same amount
+- Zero actual profit was generated — it's all accounting drift
+- Worse: `_accrue()` then sets `lastTotalAssets = newTotalAssets`, so the phantom profit gets baked into the baseline. The under-count is "fixed" by pretending the fake profit was real.
+
+**Walk through with real numbers**
+
+Setup: vault has 10,000 assets, 10,000 shares (1:1 PPS), 10% performance fee. Strategy is illiquid — can't free everything on demand.
+
+**Step 1 — User A tries to redeem 5,000:**
+- Strategy only frees 4,000
+- `loss = 1,000` (the part stuck in the external protocol)
+- User A gets 4,000 tokens (they accepted the loss via `maxLoss`)
+- Line 1181: `lastTotalAssets` drops from 10,000 to 5,000 (subtracted 5,000 total)
+
+Now the state is weird:
+- `lastTotalAssets` = 5,000
+- `strategyTotalAssets()` = 6,000 (4,000 left after withdrawal + 1,000 still deployed)
+- Gap = 1,000
+
+**Step 2 — Anyone does anything next (say, User B deposits 1 token):**
+- `_accrue()` sees 6,000 vs 5,000 → "profit" of 1,000
+- 10% fee → ~100 tokens worth of shares minted to fee recipient
+- That 100 tokens came out of remaining depositors' pockets
+
+**Bottom line:**
+- User A's 1,000 loss was real and expected
+- Fee recipient got ~100 tokens for free — no value was created
+- Remaining depositors lost ~100 tokens of claim
+- This happens again every single time there's a lossy withdrawal. It stacks.
+
+**Why this matters for Immunefi**
+
+- No attacker needed — any normal partial withdrawal in an illiquid strategy triggers it
+- That's literally what `maxLoss` is designed to allow
+- Attacker cost: $0. Damage: scales with vault size and how often withdrawals hit liquidity limits
+
+
+3. Proof of Concept
+
+## Proof of Concept
+
+The idea is simple: do a lossy redeem, then trigger any accrual, and watch the fee recipient's share balance go up even though nothing was earned.
+
+```solidity
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.18;
+
+// Fork test sketch — needs a deployed TokenizedStrategy + illiquid underlying strategy
+// performanceFee = 1000 (10%), strategy only frees ~80% of requested amount
+
+contract PhantomProfitPoC {
+    ITokenizedStrategy vault;
+    IERC20 asset;
+    address performanceFeeRecipient;
+
+    function run() external {
+        uint256 sharesBefore = vault.balanceOf(performanceFeeRecipient);
+
+        // 1. Redeem more than the strategy can actually free
+        //    maxLoss = MAX_BPS so the partial withdrawal goes through
+        vault.redeem(5000e18, address(this), address(this), 10_000);
+
+        // At this point: lastTotalAssets is under-counted,
+        // but strategyTotalAssets() still includes the stuck tokens
+
+        // 2. Any follow-up action triggers _accrue
+        asset.approve(address(vault), 1);
+        vault.deposit(1, address(this));
+
+        // 3. Fee recipient got shares from phantom "profit"
+        uint256 sharesAfter = vault.balanceOf(performanceFeeRecipient);
+
+        require(
+            sharesAfter > sharesBefore,
+            "PoC failed: fee recipient should have gained shares"
+        );
+    }
+}
+```
