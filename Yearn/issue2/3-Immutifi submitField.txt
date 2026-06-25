@@ -1,20 +1,180 @@
 1. Title
 
+Performance Fees Only Go Up, Never Down — Constant Accrual Has No Loss Buffer
+
+
 2. Description
-The more details you provide, the faster and more accurately the program can assess your bug report. You should put yourself in the shoes of the program team and ask yourself the question, "Am I describing the vulnerability and its impact clearly, accurately, and without any unnecessary assumptions?"
 
 ## Brief/Intro
-Provide a very short and concise (one paragraph) statement on what the problem is, and what the consequences would be if the bug were exploited in production/mainnet.
+
+TokenizedStrategy has two ways to handle profit and loss. The keeper `report()` path locks profit shares in the vault itself (`address(this)`) as a buffer — so when value drops later, those locked shares get burned to absorb the loss. But the constant accrual path (`_accrue`, triggered on every deposit/withdraw) charges fees immediately and sends them straight to the fee recipient. It never builds up that buffer. So when value goes up, fees get minted permanently. When value goes back down, there's nothing to burn — depositors eat the full loss, but the fee recipient keeps everything they already got. Over any bumpy period, it's a one-way ratchet from depositors to fee recipients.
 
 ## Vulnerability Details
-Offer a detailed explanation of the vulnerability itself. Do not leave out any relevant information. Code snippets should be supplied whenever helpful, as long as they don’t overcrowd the report with unnecessary details. This section should make it obvious that you understand exactly what you’re talking about, and more importantly, it should be clear by this point that the vulnerability does exist.
+
+**Two paths, two very different outcomes**
+
+**Path A — constant accrual (`_accrue`, runs on every user action)**
+
+When profit is detected, fees go out immediately:
+
+```solidity
+// _accrue(), lines 1230-1236
+} else if (oldTotalAssets != 0) {
+    (totalFees, protocolFees, ) = _chargeFees(
+        S, profit, newTotalAssets, true
+    );
+}
+```
+
+And `_chargeFees()` mints directly to the fee recipients — not to the vault:
+
+```solidity
+// _chargeFees(), lines 1301-1310
+_mint(S, protocolFeesRecipient, protocolFeeShares);
+_mint(S, S.performanceFeeRecipient, totalFeeShares - protocolFeeShares);
+```
+
+No lock. No vesting. Fee recipient keeps the shares forever.
+
+When there's a loss, `_accrue()` calls `_realizeLoss()`, which tries to burn shares from the vault's own balance as a buffer:
+
+```solidity
+// _lossBurnState(), lines 1335-1336
+uint256 buffer = S.balances[address(this)];
+if (buffer == 0) return (0, 0);   // nothing to burn — loss goes to depositors
+```
+
+But here's the catch: `_accrue()` **never** mints shares to `address(this)`. The buffer is always empty on this path. Loss = fully socialized to depositors.
+
+**Path B — keeper harvest (`report()`)**
+
+On profit, after charging fees, the net profit gets locked in the vault:
+
+```solidity
+// report(), line 1463
+_mint(S, address(this), sharesToLock - sharesToBurn);
+```
+
+Those locked shares are the loss buffer. When value drops, `_realizeLoss()` can burn them to cushion depositors.
+
+**The asymmetry in plain terms**
+
+| | Value goes up | Value goes down |
+|---|---|---|
+| `_accrue()` (Path A) | Fee shares minted to fee recipient permanently | Buffer = 0, depositors absorb 100% of loss |
+| `report()` (Path B) | Profit locked in vault as buffer | Buffer shares burned to offset loss |
+
+Any vault running mainly on constant accrual — no keeper calling `report()`, or `profitMaxUnlockTime = 0` — is stuck on Path A only. Fees ratchet up on every green tick. Losses never claw back anything on red ticks.
 
 ## Impact Details
-Provide a detailed breakdown of possible losses from an exploit, especially if there are funds at risk. This illustrates the severity of the vulnerability, but it also provides the best possible case for you to be paid the correct amount. Make sure the selected impact is within the program’s list of in-scope impacts and matches the impact you selected.
 
-## References
-Add any relevant links to documentation or code
+**What happens in practice**
+
+Every time `strategyTotalAssets()` ticks up and someone triggers `_accrue`:
+- Fee recipient gets new shares, permanently
+- No buffer is created for future losses
+
+Every time value ticks back down:
+- `_realizeLoss()` checks `S.balances[address(this)]` → it's 0
+- Nothing gets burned
+- Depositors' PPS drops, fee recipient's shares stay untouched
+
+Over a volatile period, net performance can be flat — but fee recipients still walk away with value extracted on every upswing.
+
+**Walk through with real numbers**
+
+Setup: 100,000 assets, 100,000 shares, 10% performance fee. Either `report()` has never been called, or `profitMaxUnlockTime = 0` — no buffer exists.
+
+**Cycle 1 — up tick:**
+- Strategy value rises to 110,000 (yield, price move, whatever)
+- Someone deposits → `_accrue()` fires
+- Profit = 10,000, fees = 1,000
+- ~1,000 tokens worth of shares minted to fee recipient, permanently
+- `lastTotalAssets` = 110,000
+
+**Cycle 1 — down tick:**
+- Value drops back to 100,000
+- Any action triggers `_accrue()`
+- Loss = 10,000
+- `_realizeLoss()`: buffer = 0 → burns nothing
+- `lastTotalAssets` = 100,000
+
+**Net result after one full cycle:**
+- Vault assets: 100,000 (back where it started)
+- Fee recipient: still holding ~1,000 tokens worth of shares
+- Depositors: diluted by ~1,000 tokens — they paid fees on profit that didn't stick
+
+**It gets worse with volatility**
+
+Each up-down cycle adds another layer of extraction. Example: 10% annual volatility, 100 accrual events per year, $10M TVL — fee recipients could pull $100K+ in a year where net performance is basically zero. All from the ratchet, not from actual gains.
+
+**Active exploitation (fee recipient collusion)**
+
+Someone controlling or colluding with `performanceFeeRecipient` can:
+1. Temporarily pump `strategyTotalAssets()` (donation, oracle manipulation, etc.)
+2. Trigger `_accrue()` to mint fee shares
+3. Let value revert
+
+Each cycle extracts fees from depositors at near-zero cost to the attacker. The inflation reverses; the fee shares don't.
+
+**Why this matters for Immunefi**
+
+- **Passive case:** Normal market volatility alone triggers it. No attacker needed. Zero cost, systematic depositor harm.
+- **Active case:** Collusion with fee recipient makes it directly profitable. Low risk — you're not risking principal, just temporarily moving numbers.
+
+
+
 
 3. Proof of Concept
-Providing a runnable PoC for your Bug Bounty reports is crucial because it shows that the vulnerability is real. For Solidity smart contracts, you are welcome to use our PoC templates. For standard Bug Bounty Programs, all PoCs must follow the PoC Guidelines and Rules. Breaking these rules may result in your report being rejected as well as action potentially taken against your account.
+
 ## Proof of Concept
+
+The idea: simulate an up-tick (fee shares minted), then a down-tick (nothing clawed back), and show fee recipient is richer while depositors are poorer — even though net assets are unchanged.
+
+```solidity
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.18;
+
+// Fork test sketch — vault with performanceFee = 1000 (10%)
+// report() never called (or profitMaxUnlockTime = 0), so buffer is always empty
+
+contract FeeRatchetPoC {
+    ITokenizedStrategy vault;
+    IERC20 asset;
+    address performanceFeeRecipient;
+
+    function run() external {
+        uint256 feeSharesStart = vault.balanceOf(performanceFeeRecipient);
+        uint256 depositorPpsStart = vault.pricePerShare();
+
+        // 1. Simulate value going up (e.g. yield accrues in underlying strategy)
+        //    Then trigger _accrue with any user action
+        asset.approve(address(vault), 1);
+        vault.deposit(1, address(this));
+        // fee recipient should now have more shares
+
+        uint256 feeSharesAfterUp = vault.balanceOf(performanceFeeRecipient);
+        require(feeSharesAfterUp > feeSharesStart, "fees not charged on up-tick");
+
+        // 2. Simulate value going back down (e.g. impermanent loss, withdrawal pressure)
+        //    Trigger _accrue again with any user action
+        vault.withdraw(1, address(this), address(this), 0);
+        // buffer is 0 — _realizeLoss burns nothing
+
+        uint256 feeSharesAfterDown = vault.balanceOf(performanceFeeRecipient);
+        uint256 depositorPpsEnd = vault.pricePerShare();
+
+        // Fee recipient kept their shares from the up-tick
+        require(
+            feeSharesAfterDown == feeSharesAfterUp,
+            "fee shares should not be clawed back"
+        );
+
+        // Depositors are worse off even though net assets may be flat
+        require(
+            depositorPpsEnd < depositorPpsStart,
+            "depositors should be diluted by ratchet"
+        );
+    }
+}
+```
